@@ -1,0 +1,4 @@
+nomad-data/
+project-nomad/
+*.tar
+.DS_Store
