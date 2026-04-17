@@ -64,7 +64,7 @@ services:
       - MYSQL_USER=nomad_user
       - MYSQL_PASSWORD=${DB_PASSWORD}
     volumes:
-      - ${NOMAD_STORAGE_PATH}/mysql:/var/lib/mysql
+      - nomad-mysql-data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 30s
@@ -76,7 +76,7 @@ services:
     container_name: nomad_redis
     restart: unless-stopped
     volumes:
-      - ${NOMAD_STORAGE_PATH}/redis:/data
+      - nomad-redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 30s
@@ -95,4 +95,8 @@ services:
 
 volumes:
   nomad-update-shared:
+    driver: local
+  nomad-mysql-data:
+    driver: local
+  nomad-redis-data:
     driver: local
