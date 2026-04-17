@@ -1,0 +1,400 @@
+#!/bin/bash
+set -euo pipefail
+
+# Project N.O.M.A.D. — Bidirectional sync between NAS and local laptop
+#
+# Usage:
+#   ./nas-sync push storage [categories...]   # laptop → NAS (backup storage)
+#   ./nas-sync push images                    # laptop → NAS (save Docker images)
+#   ./nas-sync push db                        # laptop → NAS (dump database)
+#   ./nas-sync push all [categories...]       # laptop → NAS (everything)
+#
+#   ./nas-sync pull storage [categories...]   # NAS → laptop (restore storage)
+#   ./nas-sync pull images                    # NAS → laptop (load Docker images)
+#   ./nas-sync pull db                        # NAS → laptop (restore database)
+#   ./nas-sync pull all [categories...]       # NAS → laptop (full restore)
+#
+#   ./nas-sync dbswitch local                 # switch DB service paths to local
+#   ./nas-sync dbswitch nas                   # switch DB service paths to NAS
+#   ./nas-sync sizes                          # show content sizes on NAS and local
+
+NAS_STORAGE="/Volumes/home/project-nomad/storage"
+NAS_IMAGES="/Volumes/home/project-nomad/docker-images"
+LOCAL_STORAGE="./nomad-data/storage"
+COMPOSE_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+NAS_STORAGE_PATH="/Volumes/home/project-nomad/storage"
+LOCAL_STORAGE_PATH="/Users/zain/code/nomad/nomad-data/storage"
+DB_USER="nomad_user"
+
+# Load DB password from .env
+if [[ -f "$COMPOSE_DIR/.env" ]]; then
+    DB_PASS=$(grep '^DB_PASSWORD=' "$COMPOSE_DIR/.env" | cut -d= -f2)
+fi
+DB_PASS="${DB_PASS:?DB_PASSWORD not set in .env}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+log()  { echo -e "${GREEN}[sync]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[sync]${RESET} $*"; }
+err()  { echo -e "${RED}[sync]${RESET} $*" >&2; }
+
+check_nas() {
+    if [[ ! -d "$NAS_STORAGE" ]]; then
+        err "NAS not mounted at $NAS_STORAGE"
+        err "Mount it first (Finder > Go > Connect to Server) then retry."
+        exit 1
+    fi
+    log "NAS is mounted."
+}
+
+check_mysql_running() {
+    docker ps --filter "name=nomad_mysql" --filter "status=running" --format '{{.Names}}' | grep -q nomad_mysql
+}
+
+wait_for_mysql() {
+    log "  Waiting for MySQL to be healthy..."
+    local retries=0
+    while ! docker exec nomad_mysql mysqladmin ping -h localhost --silent 2>/dev/null; do
+        sleep 2
+        ((retries++))
+        if [[ $retries -ge 30 ]]; then
+            warn "  MySQL didn't become healthy in time."
+            return 1
+        fi
+    done
+}
+
+# ── Content categories ────────────────────────────────────────────────
+CONTENT_CATEGORIES=(
+    "zim"          # Wikipedia, StackExchange, medical refs, prepper content (large)
+    "maps"         # Offline map tiles (large)
+    "kolibri"      # Khan Academy / Kolibri channels (large)
+    "ollama"       # Ollama model weights (very large)
+    "qdrant"       # Vector DB data for RAG
+    "flatnotes"    # Notes
+    "kb_uploads"   # Knowledge base uploads
+)
+
+# ── DB path switching ─────────────────────────────────────────────────
+
+switch_db_paths() {
+    local from="$1" to="$2" label="$3"
+
+    if ! check_mysql_running; then
+        warn "MySQL container is not running. Start Nomad first."
+        return 1
+    fi
+
+    local count
+    count=$(docker exec nomad_mysql mysql -u "$DB_USER" -p"$DB_PASS" nomad -sN \
+        -e "SELECT COUNT(*) FROM services WHERE container_config LIKE '%${from}%'" 2>/dev/null)
+
+    if [[ "$count" -eq 0 ]]; then
+        log "DB paths already set for ${label} — nothing to update."
+        return 0
+    fi
+
+    docker exec nomad_mysql mysql -u "$DB_USER" -p"$DB_PASS" nomad \
+        -e "UPDATE services SET container_config = REPLACE(container_config, '${from}', '${to}') WHERE container_config LIKE '%${from}%';" 2>/dev/null
+
+    log "Updated $count service(s) to use ${label} storage paths."
+}
+
+# ── Sizes ─────────────────────────────────────────────────────────────
+
+cmd_sizes() {
+    log "Content on NAS:"
+    for cat in "${CONTENT_CATEGORIES[@]}"; do
+        if [[ -d "$NAS_STORAGE/$cat" ]]; then
+            printf "  %-14s %s\n" "$cat" "$(du -sh "$NAS_STORAGE/$cat" 2>/dev/null | awk '{print $1}')"
+        fi
+    done
+    echo ""
+    if [[ -d "$LOCAL_STORAGE" ]]; then
+        log "Content on local:"
+        for cat in "${CONTENT_CATEGORIES[@]}"; do
+            if [[ -d "$LOCAL_STORAGE/$cat" ]]; then
+                printf "  %-14s %s\n" "$cat" "$(du -sh "$LOCAL_STORAGE/$cat" 2>/dev/null | awk '{print $1}')"
+            fi
+        done
+    fi
+}
+
+# ── PUSH (laptop → NAS) ──────────────────────────────────────────────
+
+push_storage() {
+    local categories=("$@")
+    if [[ ${#categories[@]} -eq 0 ]]; then
+        categories=("${CONTENT_CATEGORIES[@]}")
+    fi
+
+    log "Pushing storage to NAS: ${categories[*]}"
+    for cat in "${categories[@]}"; do
+        local src="$LOCAL_STORAGE/$cat"
+        local dst="$NAS_STORAGE/$cat"
+        if [[ -d "$src" ]]; then
+            log "  $cat..."
+            mkdir -p "$dst"
+            rsync -ah --progress --delete "$src/" "$dst/"
+        else
+            warn "  $cat — not present locally, skipping."
+        fi
+    done
+    log "Push storage complete."
+}
+
+push_images() {
+    local NOMAD_IMAGES=(
+        "project-nomad:local"
+        "project-nomad-sidecar-updater:local"
+        "mysql:8.0"
+        "redis:7-alpine"
+        "amir20/dozzle:v10.0"
+    )
+
+    log "Saving Docker images to NAS..."
+    mkdir -p "$NAS_IMAGES"
+
+    for img in "${NOMAD_IMAGES[@]}"; do
+        local safe_name="${img//[:\/]/_}"
+        local tar_path="$NAS_IMAGES/${safe_name}.tar"
+        if ! docker image inspect "$img" &>/dev/null; then
+            warn "  Image $img not found locally, skipping."
+            continue
+        fi
+        log "  Saving $img..."
+        docker save "$img" -o "$tar_path"
+    done
+
+    # Also save any running nomad_ sub-service images
+    local extra_images
+    extra_images=$(docker ps --filter "name=nomad_" --format '{{.Image}}' | sort -u)
+    for img in $extra_images; do
+        local already_saved=false
+        for known in "${NOMAD_IMAGES[@]}"; do
+            [[ "$img" == "$known" ]] && already_saved=true
+        done
+        $already_saved && continue
+        local safe_name="${img//[:\/]/_}"
+        log "  Saving sub-service image $img..."
+        docker save "$img" -o "$NAS_IMAGES/${safe_name}.tar" || warn "  Failed to save $img."
+    done
+
+    log "Docker images saved to NAS."
+    du -sh "$NAS_IMAGES" | awk '{print "  Image archive size: "$1}'
+}
+
+push_db() {
+    if ! check_mysql_running; then
+        warn "MySQL container is not running. Start Nomad first."
+        return 1
+    fi
+
+    local dump_dir="$NAS_STORAGE/db-backups"
+    local local_dump_dir="$LOCAL_STORAGE/db-backups"
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+
+    log "Dumping database to NAS..."
+    mkdir -p "$dump_dir" "$local_dump_dir"
+
+    docker exec nomad_mysql mysqldump \
+        -u "$DB_USER" -p"$DB_PASS" \
+        --single-transaction \
+        nomad > "$dump_dir/nomad-${timestamp}.sql"
+
+    cp "$dump_dir/nomad-${timestamp}.sql" "$dump_dir/nomad-latest.sql"
+    cp "$dump_dir/nomad-latest.sql" "$local_dump_dir/nomad-latest.sql"
+
+    # Keep only 5 most recent
+    ls -t "$dump_dir"/nomad-2*.sql 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+
+    log "Database dumped to NAS and local."
+}
+
+# ── PULL (NAS → laptop) ──────────────────────────────────────────────
+
+pull_storage() {
+    local categories=("$@")
+    if [[ ${#categories[@]} -eq 0 ]]; then
+        categories=("${CONTENT_CATEGORIES[@]}")
+        # Also sync top-level files
+        mkdir -p "$LOCAL_STORAGE"
+        rsync -ah --progress \
+            --exclude='logs/' --exclude='db-backups/' \
+            --include='*' --exclude='*/' \
+            "$NAS_STORAGE/" "$LOCAL_STORAGE/" 2>/dev/null || true
+    fi
+
+    log "Pulling storage from NAS: ${categories[*]}"
+    mkdir -p "$LOCAL_STORAGE"
+    for cat in "${categories[@]}"; do
+        local src="$NAS_STORAGE/$cat"
+        local dst="$LOCAL_STORAGE/$cat"
+        if [[ -d "$src" ]]; then
+            log "  $cat..."
+            mkdir -p "$dst"
+            rsync -ah --progress --delete "$src/" "$dst/"
+        else
+            warn "  $cat — not present on NAS, skipping."
+        fi
+    done
+    log "Pull storage complete."
+    du -sh "$LOCAL_STORAGE" | awk '{print "  Local storage size: "$1}'
+}
+
+pull_images() {
+    log "Loading Docker images from NAS..."
+    if [[ ! -d "$NAS_IMAGES" ]]; then
+        warn "No saved images at $NAS_IMAGES. Run './nas-sync push images' first."
+        return 1
+    fi
+
+    local count=0
+    for tar_file in "$NAS_IMAGES"/*.tar; do
+        [[ -f "$tar_file" ]] || continue
+        log "  Loading $(basename "$tar_file")..."
+        docker load -i "$tar_file"
+        ((count++))
+    done
+    log "Loaded $count Docker images."
+}
+
+pull_db() {
+    local dump_file="$NAS_STORAGE/db-backups/nomad-latest.sql"
+    local local_dump="$LOCAL_STORAGE/db-backups/nomad-latest.sql"
+    local restore_file=""
+
+    if [[ -f "$local_dump" ]]; then
+        restore_file="$local_dump"
+    elif [[ -f "$dump_file" ]]; then
+        restore_file="$dump_file"
+    else
+        warn "No database backup found."
+        return 1
+    fi
+
+    log "Restoring database from backup..."
+    cd "$COMPOSE_DIR"
+    docker compose -f compose.local.yaml up -d mysql
+    wait_for_mysql || true
+    docker exec -i nomad_mysql mysql \
+        -u "$DB_USER" -p"$DB_PASS" \
+        nomad < "$restore_file"
+    log "Database restored."
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+nas-sync — Bidirectional sync between NAS and local laptop
+
+Usage: ./nas-sync <direction> <target> [categories...]
+
+Push (laptop → NAS):
+  push storage [categories...]   Back up content files to NAS
+  push images                    Save Docker images to NAS as tarballs
+  push db                        Dump MySQL database to NAS
+  push all [categories...]       All of the above
+
+Pull (NAS → laptop):
+  pull storage [categories...]   Copy content files from NAS to local
+  pull images                    Load Docker images from NAS tarballs
+  pull db                        Restore MySQL database from NAS backup
+  pull all [categories...]       Full offline restore (images + storage + DB)
+
+Other:
+  dbswitch local                 Switch DB service paths to local storage
+  dbswitch nas                   Switch DB service paths to NAS storage
+  sizes                          Show content sizes on NAS and local
+
+Categories: zim maps kolibri ollama qdrant flatnotes kb_uploads
+
+Examples:
+  ./nas-sync push all                    # full backup to NAS
+  ./nas-sync pull storage zim flatnotes  # pull only ZIM files and notes
+  ./nas-sync pull all zim maps           # full restore with only ZIM + maps
+  ./nas-sync dbswitch local              # switch to local paths for offline use
+EOF
+}
+
+main() {
+    cd "$COMPOSE_DIR"
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        push)
+            check_nas
+            local target="${1:-}"
+            shift || true
+            case "$target" in
+                storage) push_storage "$@" ;;
+                images)  push_images ;;
+                db)      push_db ;;
+                all)
+                    echo ""
+                    push_storage "$@"
+                    echo ""
+                    push_images
+                    echo ""
+                    push_db
+                    echo ""
+                    log "${BOLD}Push complete.${RESET}"
+                    ;;
+                *) die "Usage: ./nas-sync push <storage|images|db|all> [categories...]" ;;
+            esac
+            ;;
+        pull)
+            check_nas
+            local target="${1:-}"
+            shift || true
+            case "$target" in
+                storage) pull_storage "$@" ;;
+                images)  pull_images ;;
+                db)      pull_db ;;
+                all)
+                    echo ""
+                    pull_images
+                    echo ""
+                    pull_storage "$@"
+                    echo ""
+                    pull_db
+                    echo ""
+                    switch_db_paths "$NAS_STORAGE_PATH" "$LOCAL_STORAGE_PATH" "local" 2>/dev/null || true
+                    echo ""
+                    log "${BOLD}Pull complete.${RESET} Start Nomad with:"
+                    echo "  docker compose -f compose.local.yaml up -d"
+                    ;;
+                *) die "Usage: ./nas-sync pull <storage|images|db|all> [categories...]" ;;
+            esac
+            ;;
+        dbswitch)
+            local target="${1:-}"
+            case "$target" in
+                local) switch_db_paths "$NAS_STORAGE_PATH" "$LOCAL_STORAGE_PATH" "local" ;;
+                nas)   switch_db_paths "$LOCAL_STORAGE_PATH" "$NAS_STORAGE_PATH" "NAS" ;;
+                *)     die "Usage: ./nas-sync dbswitch <local|nas>" ;;
+            esac
+            ;;
+        sizes)
+            check_nas
+            cmd_sizes
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

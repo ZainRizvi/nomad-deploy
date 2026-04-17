@@ -1,6 +1,7 @@
 # Project N.O.M.A.D. — Local-only configuration (no NAS required)
 # Use when NAS is unavailable: docker compose -f compose.local.yaml up -d
-# Run ./sync-from-nas.sh first to populate local storage from NAS
+# Run ./nas-sync pull first to populate local storage from NAS
+# Secrets loaded from .env file
 name: project-nomad
 services:
   admin:

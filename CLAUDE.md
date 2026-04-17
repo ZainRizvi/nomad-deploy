@@ -12,7 +12,7 @@ This directory is NOT the upstream repo itself — it wraps it with Mac-specific
 
 - **`compose.yaml`** — Primary config, storage on NAS (`/Volumes/home/project-nomad/storage`)
 - **`compose.local.yaml`** — Offline config, storage on local disk (`./nomad-data/storage`)
-- **`sync-from-nas.sh`** — Syncs storage, Docker images, and DB between NAS and laptop
+- **`nas-sync`** — Syncs storage, Docker images, and DB between NAS and laptop
 - **`project-nomad/`** — Upstream repo clone (Crosstalk Solutions)
 - **`nomad-data/`** — Local data (MySQL, Redis, and optionally storage when running offline)
 
@@ -28,12 +28,24 @@ docker compose -f compose.local.yaml up -d
 # Stop:
 docker compose down
 
-# Sync everything to laptop for offline use:
-./sync-from-nas.sh           # full sync
-./sync-from-nas.sh storage   # just content files
-./sync-from-nas.sh images    # save Docker images to NAS
-./sync-from-nas.sh db        # dump database
-./sync-from-nas.sh restore   # recover everything from NAS (disaster recovery)
+# Backup to NAS (laptop → NAS):
+./nas-sync push all                     # everything
+./nas-sync push storage                 # just content files
+./nas-sync push storage zim flatnotes   # selective categories
+./nas-sync push images                  # save Docker images as tarballs
+./nas-sync push db                      # dump database
+
+# Restore from NAS (NAS → laptop):
+./nas-sync pull all                     # full offline restore
+./nas-sync pull storage zim maps        # selective restore
+./nas-sync pull images                  # load Docker images from tarballs
+
+# Switch DB service mount paths:
+./nas-sync dbswitch local               # for offline/local mode
+./nas-sync dbswitch nas                 # for NAS-backed mode
+
+# Show content sizes:
+./nas-sync sizes
 
 # Rebuild ARM64 images from source (after upstream updates):
 docker build --platform linux/arm64 -t project-nomad:local project-nomad/

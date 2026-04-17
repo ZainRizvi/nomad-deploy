@@ -1,0 +1,268 @@
+#!/bin/bash
+set -euo pipefail
+
+# nomad-cli — LLM-friendly CLI for Project N.O.M.A.D.
+# Thin wrapper around the Nomad REST API (http://localhost:8080)
+
+NOMAD_URL="${NOMAD_URL:-http://localhost:8080}"
+QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+die()  { echo "error: $*" >&2; exit 1; }
+
+api() {
+    local method="$1" path="$2"
+    shift 2
+    local url="${NOMAD_URL}${path}"
+    local response
+    response=$(curl -sf -H "Accept: application/json" "$@" -X "$method" "$url" 2>/dev/null) \
+        || die "API request failed: $method $path (is Nomad running?)"
+    echo "$response"
+}
+
+api_stream() {
+    local method="$1" path="$2"
+    shift 2
+    local url="${NOMAD_URL}${path}"
+    curl -sN -H "Accept: application/json" "$@" -X "$method" "$url" 2>/dev/null
+}
+
+require_jq() {
+    command -v jq &>/dev/null || die "jq is required. Install with: brew install jq"
+}
+
+# ── Search (direct Qdrant query) ──────────────────────────────────────
+
+cmd_search() {
+    local query="$1" limit="${2:-5}"
+    require_jq
+
+    # Embed the query using Ollama's embedding model
+    local embedding
+    embedding=$(curl -sf "$OLLAMA_URL/api/embed" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg q "search_query: $query" --arg m "nomic-embed-text:v1.5" \
+            '{model: $m, input: $q}')" 2>/dev/null) \
+        || die "Failed to generate embedding. Is Ollama running with nomic-embed-text:v1.5 pulled?"
+
+    local vector
+    vector=$(echo "$embedding" | jq '.embeddings[0]')
+
+    # Search Qdrant
+    local results
+    results=$(curl -sf "$QDRANT_URL/collections/nomad_knowledge_base/points/search" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n \
+            --argjson vec "$vector" \
+            --argjson lim "$limit" \
+            '{vector: $vec, limit: $lim, with_payload: true}')" 2>/dev/null) \
+        || die "Qdrant search failed. Is Qdrant running?"
+
+    # Format results
+    echo "$results" | jq -r '.result[] |
+        "─── Score: \(.score | . * 100 | floor)% ── Source: \(.payload.source // "unknown") ───\n\(.payload.text)\n"'
+}
+
+# ── Chat ──────────────────────────────────────────────────────────────
+
+cmd_ask() {
+    local model="" rag=false query=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model|-m) model="$2"; shift 2 ;;
+            --rag|-r)   rag=true; shift ;;
+            *)          query="${query:+$query }$1"; shift ;;
+        esac
+    done
+    [[ -z "$query" ]] && die "Usage: nomad-cli ask <question> [--model <name>] [--rag]"
+    require_jq
+
+    # If no model specified, pick the first available from host Ollama
+    if [[ -z "$model" ]]; then
+        model=$(curl -sf "$OLLAMA_URL/api/tags" 2>/dev/null \
+            | jq -r '.models[0].name // empty' 2>/dev/null)
+        [[ -z "$model" ]] && die "No models available. Pull a model first."
+    fi
+
+    # Stream the response
+    api_stream POST /api/ollama/chat \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n \
+            --arg q "$query" \
+            --arg m "$model" \
+            --argjson rag "$rag" \
+            '{
+                model: $m,
+                messages: [{"role": "user", "content": $q}],
+                useRag: $rag,
+                stream: true
+            }')" | while IFS= read -r line; do
+        case "$line" in
+            data:*)
+                local data="${line#data:}"
+                local token
+                token=$(echo "$data" | jq -r '.message.content // empty' 2>/dev/null)
+                [[ -n "$token" ]] && printf '%s' "$token"
+                local done_flag
+                done_flag=$(echo "$data" | jq -r '.done // false' 2>/dev/null)
+                [[ "$done_flag" == "true" ]] && echo ""
+                ;;
+        esac
+    done
+}
+
+# ── List commands ─────────────────────────────────────────────────────
+
+cmd_models() {
+    require_jq
+    # Installed models from host Ollama
+    curl -sf "$OLLAMA_URL/api/tags" 2>/dev/null \
+        | jq -r '.models[] | "\(.name)\t\(.size | . / 1073741824 * 10 | floor / 10)GB"' \
+        | sort \
+        | column -t -s $'\t'
+}
+
+cmd_list_zim() {
+    require_jq
+    api GET /api/zim/list \
+        | jq -r '.files[] | .name' \
+        | sort
+}
+
+cmd_list_services() {
+    require_jq
+    api GET /api/system/services \
+        | jq -r '.[] | "\(.service_name)\t\(.friendly_name)\t\(if .installed == 1 then "installed" else "not installed" end)\t\(.status // "n/a")"' \
+        | column -t -s $'\t'
+}
+
+cmd_list_downloads() {
+    require_jq
+    api GET /api/downloads/jobs \
+        | jq -r '.[] | "\(.status)\t\(.progress // 0)%\t\(.title // .url)"' \
+        | column -t -s $'\t'
+}
+
+cmd_list_kb() {
+    require_jq
+    api GET /api/rag/files \
+        | jq -r '.files[] | "\(.source)\t\(.chunkCount) chunks"' \
+        | column -t -s $'\t'
+}
+
+cmd_zim_remote() {
+    local search="${1:-}" page="${2:-1}" limit="${3:-20}"
+    require_jq
+    local path="/api/zim/list-remote?page=${page}&limit=${limit}"
+    [[ -n "$search" ]] && path="${path}&search=${search}"
+    api GET "$path" \
+        | jq -r '.data[] | "\(.title)\t\(.filesize | . / 1048576 | floor)MB\t\(.language)\t\(.url)"' \
+        | column -t -s $'\t'
+}
+
+# ── System ────────────────────────────────────────────────────────────
+
+cmd_health() {
+    require_jq
+    api GET /api/health | jq .
+}
+
+cmd_system() {
+    require_jq
+    api GET /api/system/info | jq .
+}
+
+# ── Content management ────────────────────────────────────────────────
+
+cmd_upload() {
+    local filepath="$1"
+    [[ -f "$filepath" ]] || die "File not found: $filepath"
+    require_jq
+    api POST /api/rag/upload \
+        -F "file=@${filepath}" | jq .
+}
+
+cmd_download_zim() {
+    local url="$1"
+    [[ -z "$url" ]] && die "Usage: nomad-cli download-zim <url>"
+    require_jq
+    api POST /api/zim/download-remote \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg u "$url" '{urls: [$u]}')" | jq .
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+nomad-cli — LLM-friendly CLI for Project N.O.M.A.D.
+
+Usage: nomad-cli <command> [options]
+
+Query & Chat:
+  search <query> [limit]                     Search knowledge base directly via Qdrant
+  ask <question> [--rag] [--model <name>]    Ask a question (streams response)
+
+Content:
+  list zim                    List local ZIM files
+  list models                 List available AI models
+  list services               List all services and status
+  list downloads              List active/recent downloads
+  list kb                     List knowledge base files
+  zim-remote [search] [page]  Browse remote ZIM library
+  download-zim <url>          Download a ZIM file
+  upload <file>               Upload file to knowledge base
+
+System:
+  health                      Health check
+  system                      System info
+
+Environment:
+  NOMAD_URL     Override Nomad API base (default: http://localhost:8080)
+  QDRANT_URL    Override Qdrant URL (default: http://localhost:6333)
+  OLLAMA_URL    Override Ollama URL (default: http://localhost:11434)
+
+Examples:
+  nomad-cli search "water purification"
+  nomad-cli search "wound care" 10
+  nomad-cli ask "How do I purify water?" --rag
+  nomad-cli ask "Explain TCP/IP" --model gemma3:27b
+  nomad-cli list zim
+  nomad-cli zim-remote "medical"
+  nomad-cli upload ~/docs/field-manual.pdf
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        ask)            cmd_ask "$@" ;;
+        search)         cmd_search "$@" ;;
+        list)
+            local what="${1:-}"
+            shift || true
+            case "$what" in
+                zim)        cmd_list_zim ;;
+                models)     cmd_models ;;
+                services)   cmd_list_services ;;
+                downloads)  cmd_list_downloads ;;
+                kb)         cmd_list_kb ;;
+                *)          die "Unknown: $what (try: zim, models, services, downloads, kb)" ;;
+            esac
+            ;;
+        zim-remote)     cmd_zim_remote "$@" ;;
+        download-zim)   cmd_download_zim "$@" ;;
+        upload)         cmd_upload "$@" ;;
+        health)         cmd_health ;;
+        system)         cmd_system ;;
+        models)         cmd_models ;;
+        help|--help|-h) usage ;;
+        *)              die "Unknown command: $cmd (try: nomad-cli help)" ;;
+    esac
+}
+
+main "$@"
